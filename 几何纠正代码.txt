@@ -1,0 +1,492 @@
+// Filters.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
+//
+
+#include <iostream>
+#include <gdal.h>
+#include "gdal_priv.h"
+#include<math.h>
+using namespace std;
+
+//定义一些常量
+#define DEMxSize 4061   //DEM的列数量
+#define DEMySize 5614   //DEM的行数量
+#define SARxSize 18880   //待纠正SAR的列数量
+#define SARySize 27750   //待纠正SAR的行数量
+#define traceInitTime 58815   //这里的58815是拟合轨道时轨道点所对应时间都减去了58815以避免数据溢出，可根据拟合实际需求修改
+
+
+
+//定义point类来存放某一点的地心坐标
+class Point
+{
+public:
+    double X = 0.;
+    double Y = 0.;
+    double Z = 0.;
+
+};
+
+
+/**********************************************************************************/
+/**********************基于R-D方程的SAR图像几何纠正********************************/
+/**********************************************************************************/
+
+/*****************************************************************/
+/*******************定义一些矩阵处理方法**************************/
+/*****************************************************************/
+//转置矩阵
+//a：待转置矩阵 aT：转置矩阵        rows：行     cols：列
+void TranArray(double* a, double* aT, int rows, int cols)
+{
+    for (int i = 0;i < rows;i++)
+    {
+        for (int j = 0;j < cols;j++)
+        {
+            aT[j * rows + i] = a[i * cols + j];
+        }
+    }
+}
+//矩阵相乘
+//result=a*b      a_rows:a矩阵的行  b_cols:b矩阵的列    rols：a矩阵的列和b矩阵的行
+void MultiArray(double* a, double* b, double* result, int a_rows, int b_cols, int rols)
+{
+    for (int i = 0;i < a_rows * b_cols;i++)
+    {
+        result[i] = 0;
+    }
+    for (int i = 0;i < a_rows;i++)
+    {
+        for (int j = 0;j < b_cols;j++)
+        {
+            for (int k = 0;k < rols;k++)
+            {
+                result[i * b_cols + j] += a[i * rols + k] * b[k * b_cols + j];
+            }
+        }
+    }
+}
+//矩阵相减
+//result=a-b        rows：行     cols：列
+void SubtratArray(double* a, double* b, double* result, int rows, int cols)
+{
+    for (int i = 0;i < rows;i++)
+    {
+        for (int j = 0;j < cols;j++)
+        {
+            result[i * cols + j] = a[i * cols + j] - b[i * cols + j];
+        }
+    }
+}
+
+void make2array(double**& a, int n)
+{
+    int i, j;
+    a = new double* [n];
+    for (i = 0; i < n; i++)
+    {
+        a[i] = new double[2 * n];
+    }
+    for (i = 0; i < n; i++)
+    {
+        for (j = 0; j < 2 * n; j++)
+        {
+            a[i][j] = 0;
+        }
+    }
+}
+void deletarray(double**& a, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        delete[]a[i];
+    }
+    delete[]a;
+}
+
+//矩阵求逆
+//矩阵求逆
+//ip为要求逆的矩阵，rp是返回的逆矩阵，矩阵维数为n  
+//行列式为0，返回0；否则返回值为1
+int ConverseArray(double* ip, double* rp, int n)
+{
+    double** mat = NULL; //做行变换的矩阵   
+    int i, j, r;
+    double k, temp;
+
+    //初始化mat为0,大小为n*2n
+    make2array(mat, n);
+
+    for (i = 0; i < n; i++)
+    {
+        for (j = 0; j < n; j++)
+        {
+            mat[i][j] = ip[i * n + j];
+        }
+        mat[i][n + i] = 1; //初始化右侧的单位矩阵   
+    }
+    //做行变换化为上三角阵   
+    for (i = 0; i < n; i++)
+    {
+        if (mat[i][i] == 0) //第i行i列为0   
+        {
+            for (j = i + 1; j < n; j++)
+            {
+                if (mat[j][i] != 0)     //找一个非0行   
+                {
+                    for (r = i; r < 2 * n; r++)
+                    {
+                        temp = mat[j][r];
+                        mat[j][r] = mat[i][r];
+                        mat[i][r] = temp;
+                    }
+                    break; //跳出j循环   
+                }
+            }
+        }
+        if (mat[i][i] == 0)   return   0; //如果此时第i列全部为0，说明行列式为0则返回   
+        for (j = i + 1; j < n; j++)
+        {
+            if (mat[j][i] != 0) //i行i列下方的j行i列元素不为0   
+            {
+                k = -mat[j][i] / mat[i][i]; //做行变换   
+                for (r = i; r < 2 * n; r++)
+                    mat[j][r] = mat[j][r] + k * mat[i][r];
+            }
+        }
+    }
+
+    //化成单位矩阵   
+    for (i = n - 1; i >= 0; i--)
+    {
+        k = mat[i][i];
+        for (r = i; r < 2 * n; r++)
+            mat[i][r] = mat[i][r] / k;
+        for (j = i - 1; j >= 0; j--)
+        {
+            k = -mat[j][i];
+            for (r = i; r < 2 * n; r++)
+                mat[j][r] = mat[j][r] + k * mat[i][r];
+        }
+    }
+
+    //将结果输出   
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n; j++)
+            rp[i * n + j] = mat[i][j + n];
+
+    //mat矩阵释放 
+    deletarray(mat, n);
+    return 1;
+}
+
+/*****************************************************************/
+/*******************传感器轨道多项式拟合系数求解**************/
+/*****************************************************************/
+//coor:X或Y或Z矩阵  time：对应的时间矩阵  op：系数矩阵
+//矩阵大小请根据自己需要修改
+void track_fitting(double* coor, double* time, double* op)
+{
+    double tran_time[20] = { 0. };   //储存T的转置矩阵
+    TranArray(time, tran_time, 5, 4);  //计算T的转置矩阵
+    double temp1[16] = { 0. };
+    MultiArray(tran_time, time, temp1, 4, 4, 5);  //T的转置与T相乘   tran（T）*T
+    double con_temp1[16] = { 0. };
+    ConverseArray(temp1, con_temp1, 4);    //计算conv（ tran（T）*T ）
+    double temp2[20] = { 0. };
+    MultiArray(con_temp1, tran_time, temp2, 4, 5, 4);     // 计算 conv（ tran（T）*T ）* tran（T）
+    MultiArray(temp2, coor, op, 4, 1, 5);          //op= conv（ tran（T）*T ）* tran（T）* coor
+    cout << endl << "拟合系数求解完成！";
+}
+
+/*****************************************************************/
+/*******************读取用于拟合的XYZ坐标和时间**************/
+/*****************************************************************/
+void readTrace(const char* filename, double* X, double* Y, double* Z, double* time)
+{
+    //该函数根据自己需要编写或修改，主要是方便轨道拟合参数的读取
+    FILE* p = fopen(filename, "r");
+    if (p == NULL)
+    {
+        cout << "can ont open traceData.txt" << endl;
+        return;
+    }
+    for (int i = 0;i < 10;i++)
+    {
+        if (i < 5)
+        {
+            fscanf(p, "%lf %lf %lf", &X[i], &Y[i], &Z[i]);   //读取5个轨道点的坐标XYZ
+        }
+
+        if (i > 4)
+        {
+            //读取5个轨道点对应的时间参数t^0,t^1,t^2,t^3
+            fscanf(p, "%lf %lf %lf %lf", &time[(i - 5) * 4 + 0], &time[(i - 5) * 4 + 1], &time[(i - 5) * 4 + 2], &time[(i - 5) * 4 + 3]);
+        }
+
+
+    }
+    fclose(p);
+    cout << endl << "读取tracedata文件完成!";
+}
+
+
+/*****************************************************************/
+/*******************获取某一点卫星位置、速度矢量和加速度矢量**************/
+/*****************************************************************/
+void get_vector(double* a, double* b, double* c, double* lo_vector, double* sp_vector, double* ac_vector, double time)
+{
+    lo_vector[0] = a[0] + a[1] * time + a[2] * time * time + a[3] * time * time * time;
+    lo_vector[1] = b[0] + b[1] * time + b[2] * time * time + b[3] * time * time * time;
+    lo_vector[2] = c[0] + c[1] * time + c[2] * time * time + c[3] * time * time * time;
+
+    sp_vector[0] = a[1] + 2 * a[2] * time + 3 * a[3] * time * time;
+    sp_vector[1] = b[1] + 2 * b[2] * time + 3 * b[3] * time * time;
+    sp_vector[2] = c[1] + 2 * c[2] * time + 3 * c[3] * time * time;
+
+    ac_vector[0] = 2 * a[2] + 6 * a[3] * time;
+    ac_vector[1] = 2 * b[2] + 6 * b[3] * time;
+    ac_vector[2] = 2 * c[2] + 6 * c[3] * time;
+
+}
+
+
+/*****************************************************************/
+/*******************纠正前SAR影像读取**************/
+/*****************************************************************/
+void readSAR(const char* img, double* data)
+{
+    GDALAllRegister();
+    //支持中文路径
+    CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "NO");
+    //以只读方式打开文件
+    GDALDataset* inputData = (GDALDataset*)GDALOpen(img, GA_ReadOnly);
+    //判断文件是否打开
+    if (inputData == NULL)
+    {
+        cout << "不能打开！";
+        return;
+    }
+
+    //获取影像参数
+    int width = inputData->GetRasterXSize();  //图像宽度
+    int height = inputData->GetRasterYSize();  //图像高度
+    cout <<endl<< width << "*" << height << endl;
+
+    GDALRasterBand* bandData = inputData->GetRasterBand(1);  //获取输入影像某一波段并赋给bandData
+    bandData->RasterIO(GF_Read, 0, 0, width, height, data, width, height, GDT_Float64, 0, 0);
+    GDALClose(inputData);
+    cout << endl << "SAR影像读取完成!"<<endl;
+}
+
+/*****************************************************************/
+/*******************纠正后SAR影像写入**************/
+/*****************************************************************/
+void WriteSAR(const char*outimg,double*data)
+{
+    int xSize = DEMxSize;
+    int ySize = DEMySize;
+    GDALDriver* hDriver = GetGDALDriverManager()->GetDriverByName("GTiff");//新建一个驱动，影像格式为GTiff
+    GDALDataset* outputData = hDriver->Create(outimg,xSize,ySize, 1,GDT_Float64, NULL);//定义输出数据集
+    outputData->GetRasterBand(1)->RasterIO(GF_Write, 0, 0, xSize, ySize, data, xSize, ySize, GDT_Float64, 0, 0);
+
+    GDALClose(outputData);
+    GetGDALDriverManager()->DeregisterDriver(hDriver);
+    GDALDestroyDriverManager();
+    cout << "影像写入完成！" << endl;
+}
+
+/*****************************************************************/
+/*******************单点地心——大地坐标转换**************/
+/*****************************************************************/
+void BLHtoXYZ(double &X, double &Y, double &Z, double &B, double &L, double &H)
+{
+    //转换公式请自行百度
+    double pi = 3.1415926535;    //圆周率
+    double a = 6378137.000000;   //地球长半轴
+    double b = 6356752.310000;        //地球短半轴
+    B = B * pi / 180;
+    L = L * pi / 180;
+    double e = -sqrt(a * a - b * b) / a;
+    double N = a / (1 - e * e * sin(B) * sin(B));
+    X = (N + H) * cos(B) * cos(L);
+    Y = (N + H) * cos(B) * sin(L);
+    Z = (N * (1 - e * e) + H) * sin(B);
+
+}
+
+/*****************************************************************/
+/*******************DEM行列号转换为地心坐标**************/
+/*****************************************************************/
+//此部分请根据具体DEM的经纬度范围进行相应修改
+void DEMXYZ(const char* dem, Point* DEMData)
+{
+    GDALAllRegister();
+    //支持中文路径
+    CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "NO");
+    //以只读方式打开文件
+    GDALDataset* inputData = (GDALDataset*)GDALOpen(dem, GA_ReadOnly);
+    //判断文件是否打开
+    if (inputData == NULL)
+    {
+        cout << "不能打开！";
+        return;
+    }
+    //获取影像参数
+    int width = inputData->GetRasterXSize();  //图像宽度
+    int height = inputData->GetRasterYSize();  //图像高度
+
+    double minlat = 19.099861;double maxlat = 19.661250;
+    double minlong = -155.427350;double maxlong = -155.017639;  //经纬度最大值与最小值
+    double row_res = (maxlat - minlat) / height;
+    double col_res = (maxlong - minlong) / width;
+
+    double* demData = new double[width * height];
+    GDALRasterBand* bandData = inputData->GetRasterBand(1);  //获取输入影像某一波段并赋给bandData
+    bandData->RasterIO(GF_Read, 0, 0, width, height, demData, width, height, GDT_Float64, 0, 0);
+
+    for (int i = 0;i < height;i++)
+    {
+        for (int j = 0;j < width;j++)
+        {
+            //行列号转地理坐标
+            double B = minlat + i * row_res;
+            double L = minlong + j * col_res;
+            double H = demData[i * width + j];
+            //地理坐标转地心坐标
+            BLHtoXYZ(DEMData[i * width + j].X, DEMData[i * width + j].Y, DEMData[i * width + j].Z, B, L, H);
+        }
+    }
+
+    GDALClose(inputData);
+    delete[]demData;
+    cout << endl << "DEM行列号转地心坐标完成!";
+}
+
+/*****************************************************************/
+/*******************迭代求解方位向时间time和距离向时间t_range**************/
+/*****************************************************************/
+void T_range(Point &DEM, double &time, double* X_coef, double* Y_coef, double* Z_coef,double &t_range)
+{
+    //DEM存放某DEM点的地心坐标XYZ，time表示某一行中间像元成像时间，XYZ_coef表示轨道拟合系数,t_range表示距离向时间
+    double k = 1E-15;
+    double count = 0;    //定义迭代阈值和最大次数
+    double maxCount = 10;
+    double delta_t = 1;
+
+    for(count=0;count<maxCount;count++)
+    {
+        double lo_vector[3] = { 0. };
+        double sp_vector[3] = { 0. };
+        double ac_vector[3] = { 0. };
+        get_vector(X_coef, Y_coef, Z_coef, lo_vector, sp_vector, ac_vector, time-traceInitTime);    //拟合时时间记得减去58815
+        Point s_p;
+        s_p.X = lo_vector[0] - DEM.X;
+        s_p.Y = lo_vector[1] - DEM.Y;
+        s_p.Z = lo_vector[2] - DEM.Z;
+        double temp1 = (sp_vector[0] * s_p.X + sp_vector[1] * s_p.Y + sp_vector[2] * s_p.Z);
+        double temp2 = (ac_vector[0] * s_p.X + ac_vector[1] * s_p.Y + ac_vector[2] * s_p.Z);
+        double temp3 = (sp_vector[0] * sp_vector[0] + sp_vector[1] * sp_vector[1] + sp_vector[2] * sp_vector[2]);
+        delta_t = temp1 / (temp2+temp3);
+        //上述计算公式请自行查阅相关资料
+        time = time - delta_t;     //方位向时间微分
+        if (abs(delta_t) < k)
+        {
+            break;
+        }
+    }
+
+    double lo[3] = { 0. };
+    double sp[3] = { 0. };
+    double ac[3] = { 0. };
+    get_vector(X_coef, Y_coef, Z_coef, lo, sp, ac, time - 58815);     //利用方位向时间获取卫星位置矢量Rp
+
+    double R = 0.;  //定义斜距R
+    double c = 2.99792458E+08;   //大气层中的光速
+    R = sqrt((lo[0] - DEM.X) * (lo[0] - DEM.X) + (lo[1] - DEM.Y) * (lo[1] - DEM.Y) + (lo[2] - DEM.Z) * (lo[2] - DEM.Z));  //计算斜距
+
+    double near_range = 579188.307735;     //最近距离，请根据xml文件获取
+    R = R - near_range;    //这里我算出来的斜距减去了最近距离
+    t_range = R / c;
+
+
+}
+
+/*****************************************************************/
+/*******************对影像重采样**************/
+/*****************************************************************/
+void Resample(Point*DEMData, double* resample, double* X_coef, double* Y_coef, double* Z_coef,const char* img)
+{
+    double t0 = 58857.42499;  //开始成像时间
+    double prf = 3468.627778;   
+    double rsr = 164829192.000000;    //prf和rsr请根据xml文件获取
+
+    double* SARData = new double[27750*18880];
+    readSAR(img, SARData);
+
+
+    //循环进行重采样
+    for (int row = 0;row < DEMySize;row++)
+    {
+        for (int col = 0;col < DEMxSize;col++)
+        {
+            double t_range = 0.;
+            double t = t0 + 27748 / (2 * prf);   //行中心像元成像时间，这里27748代表的是待纠正SAR的有效行
+            T_range(DEMData[row*DEMxSize+col], t, X_coef, Y_coef, Z_coef,t_range);   //获取距离向时间t_range和方位向时间t
+
+            //计算对应SAR影像的行列号
+            int SAR_row = (int) ((t - t0) * prf+0.5);
+            int SAR_col = (int)(2*t_range  * rsr + 0.5);
+
+            //重采样
+            if ((0 < SAR_row) && (SAR_row < SARySize) && (0 < SAR_col) && (SAR_col < SARxSize))
+            {
+                resample[row * DEMxSize + col] = SARData[SAR_row * SARxSize + SAR_col];
+            }
+            else
+            {
+                resample[row * DEMxSize + col] = 0;
+            }
+
+        }
+    }
+
+    delete[]SARData;
+    cout << "重采样完成！" << endl;
+}
+
+int main()
+{
+        const char* img = "C:\\Users\\zhuosang\\Desktop\\RD\\data\\image.tif";     //原始影像路径
+        const char* output = "C:\\Users\\zhuosang\\Desktop\\RD\\data\\result.tif";    //重采样储存路径
+        const char* DEM = "C:\\Users\\zhuosang\\Desktop\\RD\\Resample.tif";        //重采样后DEM储存路径
+        const char* tracedata = "C:\\Users\\zhuosang\\Desktop\\RD\\data\\traceData.txt";    //轨道参数文件路径
+
+        double trace_X[5] = { 0. };    //定义5个GPS点三维坐标
+        double trace_Y[5] = { 0. };
+        double trace_Z[5] = { 0. };
+        double traceX_coef[4] = { 0. };    //定义XYZ拟合的12个参数
+        double traceY_coef[4] = { 0. };
+        double traceZ_coef[4] = { 0. }; 
+        double T[20] = { 0. };   //为了防止数据溢出，这里对首个时间进行了0值化处理，后续的时间应为 实际时间-traceInitTime
+
+        readTrace(tracedata, trace_X, trace_Y, trace_Z, T);  //读取轨道拟合相关参数
+        //求轨道多项式拟合参数
+        track_fitting(trace_X, T, traceX_coef);
+        track_fitting(trace_Y, T, traceY_coef);
+        track_fitting(trace_Z, T, traceZ_coef);
+
+        Point* DEMData = new Point[DEMxSize * DEMySize];
+        DEMXYZ(DEM, DEMData);  //将DEM行列号转为地心坐标并储存在DEMData中
+
+        double* resample = new double[DEMxSize * DEMySize]; //定义数组储存重采样影像
+
+        Resample(DEMData, resample, traceX_coef, traceY_coef, traceZ_coef, img);  //影像重采样
+        WriteSAR(output, resample);  //写入重采样影像
+
+        delete[]DEMData;
+        delete[]resample;
+
+        return 0;
+}
+
